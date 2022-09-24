@@ -5,9 +5,15 @@
   },
   "functions":[
     {
+      "predeploy": "npm --prefix scm-posts/functions run build",
+      "source": "scm-posts/functions",
+      "codebase": "scm-posts"
+    },
+    {
       "predeploy": "npm --prefix scm-users/functions run build",
       "source": "scm-users/functions",
       "codebase": "scm-users"
     }
+    
   ]
 }
