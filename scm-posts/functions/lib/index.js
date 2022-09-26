@@ -23,14 +23,15 @@ var __importStar = (this && this.__importStar) || function (mod) {
     return result;
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.createUserPostNotfy = exports.verifyUserNotify = exports.onCreatePost = exports.getAllPostComment = exports.createPostComment = exports.removePostLike = exports.likePost = exports.getAllPosts = exports.createPost = void 0;
+exports.getUserNotifications = exports.deleteUserNotify = exports.createUserPostNotify = exports.verifyUserNotify = exports.onCreatePost = exports.getAllPostComment = exports.createPostComment = exports.removePostLike = exports.likePost = exports.getAllPosts = exports.createPost = void 0;
 const functions = __importStar(require("firebase-functions"));
 const admin = __importStar(require("firebase-admin"));
 const uuid_1 = require("uuid");
 const zod_1 = require("zod");
 const validations_1 = require("./validations");
+const helpers_1 = require("./helpers");
 admin.initializeApp();
-const firestore = admin.firestore(functions.config().firebase);
+const firestore = admin.firestore();
 exports.createPost = functions.https.onCall(async (data, context) => {
     functions.logger.info("User create request", data === null || data === void 0 ? void 0 : data.email);
     const auth = context.auth;
@@ -58,7 +59,7 @@ exports.createPost = functions.https.onCall(async (data, context) => {
         const postData = (await createdPost.get()).data();
         functions.logger.info("create post successfully", postData);
         const userData = (await userRef.get()).data();
-        return Object.assign(Object.assign({ id: createdPost.id }, postData), { loaded: true, user: userData });
+        return Object.assign(Object.assign({ id: createdPost.id }, postData), { loaded: true, user: Object.assign({ id: userRef.id }, userData) });
     }
     catch (error) {
         functions.logger.info("failed create post");
@@ -66,25 +67,56 @@ exports.createPost = functions.https.onCall(async (data, context) => {
     }
 });
 exports.getAllPosts = functions.https.onCall(async (data, context) => {
-    var _a, _b, _c, _d, _e;
+    var _a, _b, _c, _d, _e, _f, _g;
     functions.logger.info("getAll posts request");
+    const validationResult = validations_1.getAllPostsSchema.safeParse(data);
+    if (!validationResult.success) {
+        functions.logger.error("getAllPosts request validation failed", validationResult.error);
+        throw new functions.https.HttpsError("invalid-argument", "", validationResult.error);
+    }
     try {
-        const createdPost = await firestore
+        if ((_a = validationResult.data) === null || _a === void 0 ? void 0 : _a.post_id) {
+            functions.logger.info("getAllPosts post id", (_b = validationResult.data) === null || _b === void 0 ? void 0 : _b.post_id);
+            const post = await firestore
+                .collection(process.env.POSTS_TABLE)
+                .doc(validationResult.data.post_id)
+                .get();
+            functions.logger.info("getAllPosts post object", post);
+            const postData = post.data();
+            functions.logger.info("getAllPosts post data", post.data());
+            const user = await (postData === null || postData === void 0 ? void 0 : postData.userRef);
+            const getUser = await firestore
+                .collection(process.env.USERS_TABLE)
+                .doc(user.id)
+                .get();
+            const userData = getUser.data();
+            const postWithUser = Object.assign(Object.assign({}, postData), { user: {
+                    name: userData === null || userData === void 0 ? void 0 : userData.name,
+                    email: userData === null || userData === void 0 ? void 0 : userData.email,
+                    image_url: userData === null || userData === void 0 ? void 0 : userData.image_url,
+                    id: getUser.id,
+                } });
+            return [postWithUser];
+        }
+        const allPosts = await firestore
             .collection(process.env.POSTS_TABLE)
             .orderBy("createdAt", "desc")
             .get();
-        const posts = createdPost.docs;
+        functions.logger.info("get posts successfully");
+        const posts = allPosts.docs;
         const postsWithUser = [];
         for (const post of posts) {
             const postData = post.data();
             const user = await postData.userRef.get();
+            functions.logger.info("user found(user)", (_c = postData.userRef) === null || _c === void 0 ? void 0 : _c.id);
             postsWithUser.push(Object.assign(Object.assign({ id: post.id }, postData), { user: {
-                    name: (_a = user.data()) === null || _a === void 0 ? void 0 : _a.name,
-                    email: (_b = user.data()) === null || _b === void 0 ? void 0 : _b.email,
-                    image_url: (_c = user.data()) === null || _c === void 0 ? void 0 : _c.image_url,
-                    id: ((_d = user.data()) === null || _d === void 0 ? void 0 : _d.id) || ((_e = user.data()) === null || _e === void 0 ? void 0 : _e.uid),
+                    name: (_d = user.data()) === null || _d === void 0 ? void 0 : _d.name,
+                    email: (_e = user.data()) === null || _e === void 0 ? void 0 : _e.email,
+                    image_url: (_f = user.data()) === null || _f === void 0 ? void 0 : _f.image_url,
+                    id: (_g = postData.userRef) === null || _g === void 0 ? void 0 : _g.id,
                 } }));
         }
+        functions.logger.info("get all posts sucessfully", postsWithUser);
         return postsWithUser;
     }
     catch (error) {
@@ -93,12 +125,9 @@ exports.getAllPosts = functions.https.onCall(async (data, context) => {
     }
 });
 exports.likePost = functions.https.onCall(async (data, context) => {
+    var _a, _b, _c;
     functions.logger.info("likePost request", context);
-    const auth = context.auth;
-    if (!auth) {
-        functions.logger.error("unauthenticated user likePost", context);
-        throw new functions.https.HttpsError("unauthenticated", "");
-    }
+    const auth = (0, helpers_1.validateUserAuth)(context.auth);
     const likePostSchema = zod_1.z.object({
         post_id: zod_1.z.string(),
     });
@@ -111,6 +140,10 @@ exports.likePost = functions.https.onCall(async (data, context) => {
         const postRef = firestore
             .collection(process.env.POSTS_TABLE)
             .doc(validationResult.data.post_id);
+        const userLike = await firestore
+            .collection(process.env.USERS_TABLE)
+            .doc(auth.uid)
+            .get();
         const postsData = (await postRef.get()).data();
         if (postsData === null || postsData === void 0 ? void 0 : postsData.likes.find((like) => like === auth.uid)) {
             return {
@@ -120,6 +153,26 @@ exports.likePost = functions.https.onCall(async (data, context) => {
         }
         await postRef.update({
             likes: admin.firestore.FieldValue.arrayUnion(auth.uid),
+        });
+        await firestore.collection(process.env.USER_NOTIFICATIONS_TABLE).add({
+            title: `${(_a = userLike === null || userLike === void 0 ? void 0 : userLike.data()) === null || _a === void 0 ? void 0 : _a.name} like your post!`,
+            body: "Check it out!",
+            action: "SignedIn.Posts.PostScreen",
+            deepLink: `socialmedia://socialmedia/SignedIn.Posts.PostsScreen/${validationResult.data.post_id}`,
+            userRefs: admin.firestore.FieldValue.arrayUnion(auth.uid),
+        });
+        const token = (_b = userLike === null || userLike === void 0 ? void 0 : userLike.data()) === null || _b === void 0 ? void 0 : _b.token;
+        functions.logger.info("sending notifications", token);
+        await admin.messaging().sendMulticast({
+            tokens: [token],
+            notification: {
+                title: `${(_c = userLike === null || userLike === void 0 ? void 0 : userLike.data()) === null || _c === void 0 ? void 0 : _c.name} like your post!`,
+                body: "Check it out!",
+            },
+            data: {
+                action: "SignedIn.Posts.PostScreen",
+                deepLink: `socialmedia://socialmedia/SignedIn.Posts.PostsScreen/${validationResult.data.post_id}`,
+            },
         });
         return {
             statusCode: 204,
@@ -282,7 +335,7 @@ exports.onCreatePost = functions.firestore
         functions.logger.info("A new post was created", snap.data().userRef);
         const getUserPost = firestore
             .collection(process.env.USERS_TABLE)
-            .doc(snap.data().userRef)
+            .doc(snap.data().userRef.id)
             .get();
         if (!(await getUserPost).exists)
             throw new functions.https.HttpsError("internal", "user does not exists", getUserPost);
@@ -296,11 +349,19 @@ exports.onCreatePost = functions.firestore
             postInfos = doc;
         });
         functions.logger.info("post infos", postInfos === null || postInfos === void 0 ? void 0 : postInfos.data());
+        const postId = snap.id;
         if (postInfos) {
+            const userIds = postInfos.data().userRefs;
+            functions.logger.info("users ids", userIds);
+            await firestore.collection(process.env.USER_NOTIFICATIONS_TABLE).add({
+                title: `There's a new post from ${userData === null || userData === void 0 ? void 0 : userData.name}`,
+                body: "Check it out!",
+                action: "SignedIn.Posts.PostScreen",
+                deepLink: `socialmedia://socialmedia/SignedIn.Posts.PostsScreen/${postId}`,
+                userRefs: userIds,
+            });
             functions.logger.info("get user post registered notification tokens", postInfos.data());
-            const tokens = postInfos
-                .data()
-                .users.map((item) => item.token);
+            const tokens = postInfos.data().users;
             functions.logger.info("sending notifications", tokens);
             const result = await admin.messaging().sendMulticast({
                 tokens,
@@ -308,7 +369,10 @@ exports.onCreatePost = functions.firestore
                     title: `There's a new post from ${userData === null || userData === void 0 ? void 0 : userData.name}`,
                     body: "Check it out!",
                 },
-                data: { hello: "world!", type: "SignedIn.Posts.PostScreen" },
+                data: {
+                    action: "SignedIn.Posts.PostScreen",
+                    deepLink: `socialmedia://socialmedia/SignedIn.Posts.PostsScreen/${postId}`,
+                },
             });
             functions.logger.info("push notification results", result);
             return;
@@ -333,29 +397,29 @@ exports.verifyUserNotify = functions.https.onCall(async (data, context) => {
     }
     const postUserRef = firestore
         .collection(process.env.USERS_TABLE)
-        .doc(auth.uid);
+        .doc(validationResult.data.user_id);
     const notificatedUserRef = await firestore
         .collection(process.env.USERS_TABLE)
-        .doc(validationResult.data.user_id)
+        .doc(auth.uid)
         .get();
     const notificatedUserData = notificatedUserRef.data();
     const notificationExists = await firestore
         .collection(process.env.POST_NOTIFICATIONS_TABLE)
         .where("userRef", "==", postUserRef)
-        .where("users", "array-contains", [
-        { token: notificatedUserData === null || notificatedUserData === void 0 ? void 0 : notificatedUserData.token, userRef: notificatedUserRef },
-    ])
+        .where("users", "array-contains", notificatedUserData === null || notificatedUserData === void 0 ? void 0 : notificatedUserData.token)
         .get();
     if (notificationExists.empty) {
+        functions.logger.info("user is not in list to be notificated", validationResult.data.user_id);
         return {
             notify: false,
         };
     }
+    functions.logger.info("user is in list to be notificated", validationResult.data.user_id);
     return {
         notify: true,
     };
 });
-exports.createUserPostNotfy = functions.https.onCall(async (data, context) => {
+exports.createUserPostNotify = functions.https.onCall(async (data, context) => {
     functions.logger.info("verifyUserNotify request", context);
     const auth = context.auth;
     if (!auth) {
@@ -369,12 +433,11 @@ exports.createUserPostNotfy = functions.https.onCall(async (data, context) => {
     }
     const postUserRef = firestore
         .collection(process.env.USERS_TABLE)
-        .doc(auth.uid);
-    const notificatedUserRef = await firestore
+        .doc(validationResult.data.user_id);
+    const notificatedUserRef = firestore
         .collection(process.env.USERS_TABLE)
-        .doc(validationResult.data.user_id)
-        .get();
-    const notificatedUserData = notificatedUserRef.data();
+        .doc(auth.uid);
+    const notificatedUserData = (await notificatedUserRef.get()).data();
     if (!(notificatedUserData === null || notificatedUserData === void 0 ? void 0 : notificatedUserData.token)) {
         functions.logger.error("user has no device token", notificatedUserData);
         throw new functions.https.HttpsError("not-found", "user has no device token");
@@ -387,9 +450,8 @@ exports.createUserPostNotfy = functions.https.onCall(async (data, context) => {
         functions.logger.error("there is not notification", notificationExistsRef);
         await firestore.collection(process.env.POST_NOTIFICATIONS_TABLE).add({
             userRef: postUserRef,
-            users: [
-                { token: notificatedUserData === null || notificatedUserData === void 0 ? void 0 : notificatedUserData.token, userRef: notificatedUserRef },
-            ],
+            users: admin.firestore.FieldValue.arrayUnion(notificatedUserData === null || notificatedUserData === void 0 ? void 0 : notificatedUserData.token),
+            userRefs: admin.firestore.FieldValue.arrayUnion(auth.uid),
         });
         functions.logger.error("notification created sucessfully", notificationExistsRef);
         return {
@@ -405,14 +467,64 @@ exports.createUserPostNotfy = functions.https.onCall(async (data, context) => {
         .collection(process.env.POST_NOTIFICATIONS_TABLE)
         .doc(notificationExistsData.ref.id)
         .update({
-        users: admin.firestore.FieldValue.arrayUnion({
-            userRef: notificationExistsRef,
-            token: notificatedUserData.token,
-        }),
+        users: admin.firestore.FieldValue.arrayUnion(notificatedUserData.token),
+        userRefs: admin.firestore.FieldValue.arrayUnion(auth.uid),
     });
     functions.logger.error("notification updated sucessfully", notificationExistsRef);
     return {
         created: true,
     };
+});
+exports.deleteUserNotify = functions.https.onCall(async (data, context) => {
+    functions.logger.info("deleteUserNotify request", data);
+    const auth = context.auth;
+    if (!auth) {
+        functions.logger.error("unauthenticated user deleteUserNotify", context);
+        throw new functions.https.HttpsError("unauthenticated", "");
+    }
+    const validationResult = validations_1.getUserNotifySchema.safeParse(data);
+    if (!validationResult.success) {
+        functions.logger.error("deleteUserNotify request validation failed", validationResult.error);
+        throw new functions.https.HttpsError("invalid-argument", "", validationResult.error);
+    }
+    const postUserRef = firestore
+        .collection(process.env.USERS_TABLE)
+        .doc(validationResult.data.user_id);
+    const notificatedUserRef = await firestore
+        .collection(process.env.USERS_TABLE)
+        .doc(auth.uid)
+        .get();
+    const notificationExists = await firestore
+        .collection(process.env.POST_NOTIFICATIONS_TABLE)
+        .where("userRef", "==", postUserRef)
+        .where("users", "array-contains", notificatedUserRef.data().token)
+        .get();
+    let userNotifications;
+    notificationExists.docs.forEach((doc) => {
+        userNotifications = doc;
+    });
+    if (!notificationExists.empty) {
+        await firestore
+            .collection(process.env.POST_NOTIFICATIONS_TABLE)
+            .doc(userNotifications === null || userNotifications === void 0 ? void 0 : userNotifications.id)
+            .update({
+            users: admin.firestore.FieldValue.arrayRemove(notificatedUserRef.data().token),
+            userRefs: admin.firestore.FieldValue.arrayRemove(auth.uid),
+        });
+    }
+    functions.logger.error("updateUserNotify successfully");
+});
+exports.getUserNotifications = functions.https.onCall(async (data, context) => {
+    functions.logger.info("verifyUserNotify request", context);
+    const auth = (0, helpers_1.validateUserAuth)(context.auth);
+    const notifications = await firestore
+        .collection(process.env.USER_NOTIFICATIONS_TABLE)
+        .where("userRefs", "array-contains", auth.uid)
+        .get();
+    let notificationsResult = [];
+    notifications.docs.forEach((doc) => {
+        notificationsResult.push(doc.data());
+    });
+    return notificationsResult;
 });
 //# sourceMappingURL=index.js.map

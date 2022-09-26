@@ -23,7 +23,7 @@ var __importStar = (this && this.__importStar) || function (mod) {
     return result;
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.searchUsers = exports.getAllUserPosts = exports.getUserData = exports.getUserInfos = exports.getMe = exports.authenticate = exports.updateUser = exports.create = void 0;
+exports.onUpdateUser = exports.getAllUserPosts = exports.getUserData = exports.getUserInfos = exports.getMe = exports.authenticate = exports.updateUser = exports.create = void 0;
 const functions = __importStar(require("firebase-functions"));
 const admin = __importStar(require("firebase-admin"));
 const zod_1 = require("zod");
@@ -33,7 +33,7 @@ const helpers_1 = require("./helpers");
 admin.initializeApp();
 const firestore = admin.firestore();
 exports.create = functions.https.onCall(async (data) => {
-    functions.logger.info("User create request", data === null || data === void 0 ? void 0 : data.email);
+    functions.logger.info("User create request", process.env.PROJECT_ID, process.env.SERVICE_ACCOUNT_ID);
     const validationResult = validations_1.createUserSchema.safeParse(data);
     if (!validationResult.success) {
         functions.logger.error("User create request validation failed", validationResult.error);
@@ -114,16 +114,17 @@ exports.authenticate = functions.https.onCall(async (data) => {
     functions.logger.info("get user query success", userData === null || userData === void 0 ? void 0 : userData.data());
     const userPassword = userData === null || userData === void 0 ? void 0 : userData.data().password;
     if (await (0, bcrypt_1.compare)(password, userPassword)) {
-        throw new functions.https.HttpsError("permission-denied", "Email or password is invalid");
+        const firebaseToken = await admin.auth().createCustomToken(userData === null || userData === void 0 ? void 0 : userData.id);
+        functions.logger.info("User login request validation success", {
+            id: userData === null || userData === void 0 ? void 0 : userData.id,
+            email: userData === null || userData === void 0 ? void 0 : userData.email,
+        });
+        return {
+            token: firebaseToken,
+        };
     }
-    const firebaseToken = await admin.auth().createCustomToken(userData === null || userData === void 0 ? void 0 : userData.id);
-    functions.logger.info("User login request validation success", {
-        id: userData === null || userData === void 0 ? void 0 : userData.id,
-        email: userData === null || userData === void 0 ? void 0 : userData.email,
-    });
-    return {
-        token: firebaseToken,
-    };
+    functions.logger.error("incorrect email or password", validationResult.data.email);
+    throw new functions.https.HttpsError("permission-denied", "Email or password is invalid");
 });
 exports.getMe = functions.https.onCall(async (data, context) => {
     const auth = context.auth;
@@ -221,27 +222,41 @@ exports.getAllUserPosts = functions.https.onCall(async (data, context) => {
     }
     return [];
 });
-exports.searchUsers = functions.https.onCall(async (data, context) => {
-    (0, helpers_1.validateUserAuth)(context.auth);
-    functions.logger.info("searchUsers request", data);
-    const validationResult = validations_1.searchUsersSchema.safeParse(data);
-    functions.logger.info("validation result searchUsers", validationResult);
-    if (!validationResult.success) {
-        functions.logger.error("searchUsers request validation failed", validationResult.error);
-        throw new functions.https.HttpsError("invalid-argument", validationResult.error.message);
+exports.onUpdateUser = functions.firestore
+    .document("posts/{token}")
+    .onUpdate(async (change, context) => {
+    try {
+        const oldData = change.before.data();
+        const newValue = change.after.data();
+        if (!newValue.token) {
+            return;
+        }
+        functions.logger.info("A user was updated", newValue.email);
+        const getUserNotifications = await firestore
+            .collection(process.env.POST_NOTIFICATIONS_TABLE)
+            .where("users", "array-contains", oldData.token)
+            .get();
+        if (!getUserNotifications.empty) {
+            functions.logger.info("found a user token");
+            for (const doc of getUserNotifications.docs) {
+                await firestore
+                    .collection(process.env.POST_NOTIFICATIONS_TABLE)
+                    .doc(doc.id)
+                    .update({
+                    users: admin.firestore.FieldValue.arrayUnion(newValue.token),
+                });
+                await firestore
+                    .collection(process.env.POST_NOTIFICATIONS_TABLE)
+                    .doc(doc.id)
+                    .update({
+                    users: admin.firestore.FieldValue.arrayRemove(oldData.token),
+                });
+            }
+            functions.logger.info("removed old token and added new token sucessfully");
+        }
     }
-    const searchKey = validationResult.data.name;
-    const users = await firestore
-        .collection(process.env.USERS_TABLE)
-        .orderBy("name")
-        .startAt([searchKey])
-        .endAt([searchKey + "\uf8ff"])
-        .get();
-    if (users.empty) {
-        functions.logger.debug("users not found", validationResult);
-        return [];
+    catch (error) {
+        functions.logger.error("failed on user update trigger", error);
     }
-    functions.logger.debug("searchUsers success", users);
-    return users;
 });
 //# sourceMappingURL=index.js.map

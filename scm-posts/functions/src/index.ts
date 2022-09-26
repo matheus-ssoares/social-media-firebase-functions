@@ -2,26 +2,24 @@ import * as functions from "firebase-functions";
 import * as admin from "firebase-admin";
 import { v4 as uuidv4 } from "uuid";
 import { z } from "zod";
-import { getUserNotifySchema } from "./validations";
+import {
+  createCommentSchema,
+  createPostSchema,
+  getAllPostCommentSchema,
+  getAllPostsSchema,
+  getUserNotifySchema,
+  likePostSchema,
+} from "./validations";
+import { validateUserAuth } from "./helpers";
+import { Comments, UserNotification } from "./interfaces";
 
 admin.initializeApp();
 
-const firestore = admin.firestore(functions.config().firebase);
+const firestore = admin.firestore();
 
 export const createPost = functions.https.onCall(async (data, context) => {
   functions.logger.info("User create request", data?.email);
-  const auth = context.auth;
-
-  if (!auth) {
-    functions.logger.error("unauthenticated user createPost", context);
-    throw new functions.https.HttpsError("unauthenticated", "");
-  }
-
-  const createPostSchema = z.object({
-    description: z.string().max(240),
-    image_url: z.string(),
-    image_preview: z.string(),
-  });
+  const auth = validateUserAuth(context.auth);
 
   const validationResult = createPostSchema.safeParse(data);
 
@@ -61,7 +59,10 @@ export const createPost = functions.https.onCall(async (data, context) => {
       id: createdPost.id,
       ...postData,
       loaded: true,
-      user: userData,
+      user: {
+        id: userRef.id,
+        ...userData,
+      },
     };
   } catch (error) {
     functions.logger.info("failed create post");
@@ -73,13 +74,59 @@ export const createPost = functions.https.onCall(async (data, context) => {
 export const getAllPosts = functions.https.onCall(async (data, context) => {
   functions.logger.info("getAll posts request");
 
+  const validationResult = getAllPostsSchema.safeParse(data);
+
+  if (!validationResult.success) {
+    functions.logger.error(
+      "getAllPosts request validation failed",
+      validationResult.error
+    );
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "",
+      validationResult.error
+    );
+  }
+
   try {
-    const createdPost = await firestore
+    if (validationResult.data?.post_id) {
+      functions.logger.info(
+        "getAllPosts post id",
+        validationResult.data?.post_id
+      );
+      const post = await firestore
+        .collection(process.env.POSTS_TABLE!)
+        .doc(validationResult.data.post_id)
+        .get();
+      functions.logger.info("getAllPosts post object", post);
+      const postData = post.data();
+      functions.logger.info("getAllPosts post data", post.data());
+      const user = await postData?.userRef;
+
+      const getUser = await firestore
+        .collection(process.env.USERS_TABLE!)
+        .doc(user.id)
+        .get();
+
+      const userData = getUser.data();
+      const postWithUser = {
+        ...postData,
+        user: {
+          name: userData?.name,
+          email: userData?.email,
+          image_url: userData?.image_url,
+          id: getUser.id,
+        },
+      };
+
+      return [postWithUser];
+    }
+    const allPosts = await firestore
       .collection(process.env.POSTS_TABLE!)
       .orderBy("createdAt", "desc")
       .get();
-
-    const posts = createdPost.docs;
+    functions.logger.info("get posts successfully");
+    const posts = allPosts.docs;
     const postsWithUser: {
       id: string;
       description: string;
@@ -98,6 +145,8 @@ export const getAllPosts = functions.https.onCall(async (data, context) => {
 
       const user = await postData.userRef.get();
 
+      functions.logger.info("user found(user)", postData.userRef?.id);
+
       postsWithUser.push({
         id: post.id,
         ...postData,
@@ -105,7 +154,7 @@ export const getAllPosts = functions.https.onCall(async (data, context) => {
           name: user.data()?.name,
           email: user.data()?.email,
           image_url: user.data()?.image_url,
-          id: user.data()?.id || user.data()?.uid,
+          id: postData.userRef?.id,
         },
       } as {
         id: string;
@@ -120,7 +169,7 @@ export const getAllPosts = functions.https.onCall(async (data, context) => {
         };
       });
     }
-
+    functions.logger.info("get all posts sucessfully", postsWithUser);
     return postsWithUser;
   } catch (error) {
     functions.logger.error("failed on getAll posts", error);
@@ -132,12 +181,7 @@ export const getAllPosts = functions.https.onCall(async (data, context) => {
 export const likePost = functions.https.onCall(async (data, context) => {
   functions.logger.info("likePost request", context);
 
-  const auth = context.auth;
-
-  if (!auth) {
-    functions.logger.error("unauthenticated user likePost", context);
-    throw new functions.https.HttpsError("unauthenticated", "");
-  }
+  const auth = validateUserAuth(context.auth);
 
   const likePostSchema = z.object({
     post_id: z.string(),
@@ -161,6 +205,11 @@ export const likePost = functions.https.onCall(async (data, context) => {
       .collection(process.env.POSTS_TABLE!)
       .doc(validationResult.data.post_id);
 
+    const userLike = await firestore
+      .collection(process.env.USERS_TABLE!)
+      .doc(auth.uid)
+      .get();
+
     const postsData = (await postRef.get()).data();
 
     if (postsData?.likes.find((like: string) => like === auth.uid)) {
@@ -171,6 +220,28 @@ export const likePost = functions.https.onCall(async (data, context) => {
     }
     await postRef.update({
       likes: admin.firestore.FieldValue.arrayUnion(auth.uid),
+    });
+    await firestore.collection(process.env.USER_NOTIFICATIONS_TABLE!).add({
+      title: `${userLike?.data()?.name} like your post!`,
+      body: "Check it out!",
+      action: "SignedIn.Posts.PostScreen",
+      deepLink: `socialmedia://socialmedia/SignedIn.Posts.PostsScreen/${validationResult.data.post_id}`,
+      userRefs: admin.firestore.FieldValue.arrayUnion(auth.uid),
+    });
+
+    const token = userLike?.data()?.token;
+
+    functions.logger.info("sending notifications", token);
+    await admin.messaging().sendMulticast({
+      tokens: [token],
+      notification: {
+        title: `${userLike?.data()?.name} like your post!`,
+        body: "Check it out!",
+      },
+      data: {
+        action: "SignedIn.Posts.PostScreen",
+        deepLink: `socialmedia://socialmedia/SignedIn.Posts.PostsScreen/${validationResult.data.post_id}`,
+      },
     });
     return {
       statusCode: 204,
@@ -184,16 +255,7 @@ export const likePost = functions.https.onCall(async (data, context) => {
 export const removePostLike = functions.https.onCall(async (data, context) => {
   functions.logger.info("removePostLike request", context);
 
-  const auth = context.auth;
-
-  if (!auth) {
-    functions.logger.error("unauthenticated user createPost", context);
-    throw new functions.https.HttpsError("unauthenticated", "");
-  }
-
-  const likePostSchema = z.object({
-    post_id: z.string(),
-  });
+  const auth = validateUserAuth(context.auth);
 
   const validationResult = likePostSchema.safeParse(data);
 
@@ -231,17 +293,7 @@ export const createPostComment = functions.https.onCall(
   async (data, context) => {
     functions.logger.info("createPostComment request", context);
 
-    const auth = context.auth;
-
-    if (!auth) {
-      functions.logger.error("unauthenticated user createPostComment", context);
-      throw new functions.https.HttpsError("unauthenticated", "");
-    }
-
-    const createCommentSchema = z.object({
-      post_id: z.string(),
-      content: z.string(),
-    });
+    const auth = validateUserAuth(context.auth);
 
     const validationResult = createCommentSchema.safeParse(data);
 
@@ -322,28 +374,12 @@ export const createPostComment = functions.https.onCall(
     }
   }
 );
-interface Comments {
-  id: string;
-  content: string;
-  user?: {
-    id: string;
-    name: string;
-  };
-}
+
 export const getAllPostComment = functions.https.onCall(
   async (data, context) => {
     functions.logger.info("getAllPostComment request", context);
 
-    const auth = context.auth;
-
-    if (!auth) {
-      functions.logger.error("unauthenticated user getAllPostComment", context);
-      throw new functions.https.HttpsError("unauthenticated", "");
-    }
-
-    const getAllPostCommentSchema = z.object({
-      post_id: z.string(),
-    });
+    validateUserAuth(context.auth);
 
     const validationResult = getAllPostCommentSchema.safeParse(data);
 
@@ -415,7 +451,7 @@ export const onCreatePost = functions.firestore
 
       const getUserPost = firestore
         .collection(process.env.USERS_TABLE!)
-        .doc(snap.data().userRef)
+        .doc(snap.data().userRef.id)
         .get();
 
       if (!(await getUserPost).exists)
@@ -440,16 +476,25 @@ export const onCreatePost = functions.firestore
         postInfos = doc;
       });
       functions.logger.info("post infos", postInfos?.data());
+      const postId = snap.id;
 
       if (postInfos) {
+        const userIds = postInfos.data().userRefs;
+        functions.logger.info("users ids", userIds);
+
+        await firestore.collection(process.env.USER_NOTIFICATIONS_TABLE!).add({
+          title: `There's a new post from ${userData?.name}`,
+          body: "Check it out!",
+          action: "SignedIn.Posts.PostScreen",
+          deepLink: `socialmedia://socialmedia/SignedIn.Posts.PostsScreen/${postId}`,
+          userRefs: userIds,
+        });
         functions.logger.info(
           "get user post registered notification tokens",
           postInfos.data()
         );
 
-        const tokens = postInfos
-          .data()
-          .users.map((item: { userRef: string; token: string }) => item.token);
+        const tokens = postInfos.data().users;
 
         functions.logger.info("sending notifications", tokens);
         const result = await admin.messaging().sendMulticast({
@@ -458,7 +503,10 @@ export const onCreatePost = functions.firestore
             title: `There's a new post from ${userData?.name}`,
             body: "Check it out!",
           },
-          data: { hello: "world!", type: "SignedIn.Posts.PostScreen" },
+          data: {
+            action: "SignedIn.Posts.PostScreen",
+            deepLink: `socialmedia://socialmedia/SignedIn.Posts.PostsScreen/${postId}`,
+          },
         });
 
         functions.logger.info("push notification results", result);
@@ -477,12 +525,7 @@ export const verifyUserNotify = functions.https.onCall(
   async (data, context) => {
     functions.logger.info("verifyUserNotify request", context);
 
-    const auth = context.auth;
-
-    if (!auth) {
-      functions.logger.error("unauthenticated user verifyUserNotify", context);
-      throw new functions.https.HttpsError("unauthenticated", "");
-    }
+    const auth = validateUserAuth(context.auth);
 
     const validationResult = getUserNotifySchema.safeParse(data);
 
@@ -499,43 +542,43 @@ export const verifyUserNotify = functions.https.onCall(
     }
     const postUserRef = firestore
       .collection(process.env.USERS_TABLE!)
-      .doc(auth.uid);
+      .doc(validationResult.data.user_id);
     const notificatedUserRef = await firestore
       .collection(process.env.USERS_TABLE!)
-      .doc(validationResult.data.user_id)
+      .doc(auth.uid)
       .get();
-
     const notificatedUserData = notificatedUserRef.data();
-
     const notificationExists = await firestore
       .collection(process.env.POST_NOTIFICATIONS_TABLE!)
       .where("userRef", "==", postUserRef)
-      .where("users", "array-contains", [
-        { token: notificatedUserData?.token, userRef: notificatedUserRef },
-      ])
+      .where("users", "array-contains", notificatedUserData?.token)
       .get();
 
     if (notificationExists.empty) {
+      functions.logger.info(
+        "user is not in list to be notificated",
+        validationResult.data.user_id
+      );
+
       return {
         notify: false,
       };
     }
+    functions.logger.info(
+      "user is in list to be notificated",
+      validationResult.data.user_id
+    );
     return {
       notify: true,
     };
   }
 );
 
-export const createUserPostNotfy = functions.https.onCall(
+export const createUserPostNotify = functions.https.onCall(
   async (data, context) => {
     functions.logger.info("verifyUserNotify request", context);
 
-    const auth = context.auth;
-
-    if (!auth) {
-      functions.logger.error("unauthenticated user verifyUserNotify", context);
-      throw new functions.https.HttpsError("unauthenticated", "");
-    }
+    const auth = validateUserAuth(context.auth);
 
     const validationResult = getUserNotifySchema.safeParse(data);
 
@@ -552,13 +595,12 @@ export const createUserPostNotfy = functions.https.onCall(
     }
     const postUserRef = firestore
       .collection(process.env.USERS_TABLE!)
-      .doc(auth.uid);
-    const notificatedUserRef = await firestore
+      .doc(validationResult.data.user_id);
+    const notificatedUserRef = firestore
       .collection(process.env.USERS_TABLE!)
-      .doc(validationResult.data.user_id)
-      .get();
+      .doc(auth.uid);
 
-    const notificatedUserData = notificatedUserRef.data();
+    const notificatedUserData = (await notificatedUserRef.get()).data();
 
     if (!notificatedUserData?.token) {
       functions.logger.error("user has no device token", notificatedUserData);
@@ -580,9 +622,10 @@ export const createUserPostNotfy = functions.https.onCall(
       );
       await firestore.collection(process.env.POST_NOTIFICATIONS_TABLE!).add({
         userRef: postUserRef,
-        users: [
-          { token: notificatedUserData?.token, userRef: notificatedUserRef },
-        ],
+        users: admin.firestore.FieldValue.arrayUnion(
+          notificatedUserData?.token
+        ),
+        userRefs: admin.firestore.FieldValue.arrayUnion(auth.uid),
       });
       functions.logger.error(
         "notification created sucessfully",
@@ -604,10 +647,8 @@ export const createUserPostNotfy = functions.https.onCall(
       .collection(process.env.POST_NOTIFICATIONS_TABLE!)
       .doc(notificationExistsData!.ref!.id)
       .update({
-        users: admin.firestore.FieldValue.arrayUnion({
-          userRef: notificationExistsRef,
-          token: notificatedUserData.token,
-        }),
+        users: admin.firestore.FieldValue.arrayUnion(notificatedUserData.token),
+        userRefs: admin.firestore.FieldValue.arrayUnion(auth.uid),
       });
     functions.logger.error(
       "notification updated sucessfully",
@@ -616,5 +657,80 @@ export const createUserPostNotfy = functions.https.onCall(
     return {
       created: true,
     };
+  }
+);
+export const deleteUserNotify = functions.https.onCall(
+  async (data, context) => {
+    functions.logger.info("deleteUserNotify request", data);
+
+    const auth = validateUserAuth(context.auth);
+
+    const validationResult = getUserNotifySchema.safeParse(data);
+
+    if (!validationResult.success) {
+      functions.logger.error(
+        "deleteUserNotify request validation failed",
+        validationResult.error
+      );
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "",
+        validationResult.error
+      );
+    }
+    const postUserRef = firestore
+      .collection(process.env.USERS_TABLE!)
+      .doc(validationResult.data.user_id);
+    const notificatedUserRef = await firestore
+      .collection(process.env.USERS_TABLE!)
+      .doc(auth.uid)
+      .get();
+
+    const notificationExists = await firestore
+      .collection(process.env.POST_NOTIFICATIONS_TABLE!)
+      .where("userRef", "==", postUserRef)
+      .where("users", "array-contains", notificatedUserRef.data()!.token)
+      .get();
+
+    let userNotifications:
+      | admin.firestore.QueryDocumentSnapshot<admin.firestore.DocumentData>
+      | undefined;
+
+    notificationExists.docs.forEach((doc) => {
+      userNotifications = doc;
+    });
+
+    if (!notificationExists.empty) {
+      await firestore
+        .collection(process.env.POST_NOTIFICATIONS_TABLE!)
+        .doc(userNotifications?.id!)
+        .update({
+          users: admin.firestore.FieldValue.arrayRemove(
+            notificatedUserRef.data()!.token
+          ),
+          userRefs: admin.firestore.FieldValue.arrayRemove(auth.uid),
+        });
+    }
+    functions.logger.error("updateUserNotify successfully");
+  }
+);
+
+export const getUserNotifications = functions.https.onCall(
+  async (data, context) => {
+    functions.logger.info("verifyUserNotify request", context);
+
+    const auth = validateUserAuth(context.auth);
+
+    const notifications = await firestore
+      .collection(process.env.USER_NOTIFICATIONS_TABLE!)
+      .where("userRefs", "array-contains", auth.uid)
+      .get();
+
+    let notificationsResult: Array<UserNotification> = [];
+    notifications.docs.forEach((doc) => {
+      notificationsResult.push(doc.data() as UserNotification);
+    });
+
+    return notificationsResult;
   }
 );
